@@ -25,7 +25,7 @@ m4_ifndef([PKG_CHECK_MODULES], [m4_defun([PKG_CHECK_MODULES], [AC_MSG_ERROR(
 [Could not locate the pkg-config autoconf macros.  These are usually located
 in /usr/share/aclocal/pkg.m4.  If your macros are in a different location,
 try setting the environment variable ACLOCAL_OPTS="-I/other/macro/dir"
-before running ./bootstrap.sh again, or configure --without-gtk --without-jansson ])])
+before running ./bootstrap.sh again, or configure --without-gtk --without-jansson --without-ipinfo ])])
 ])
 PKG_PROG_PKG_CONFIG
 
@@ -112,6 +112,15 @@ AS_IF([test "x$with_jansson" = "xyes"],
     [with_jansson=no])
 ])
 
+AC_ARG_WITH([libcurl],
+  [AS_HELP_STRING([--without-libcurl], [Build without libcurl-based ipinfo lookups])],
+  [], [with_libcurl=yes])
+AS_IF([test "x$with_libcurl" = "xyes"],
+  [PKG_CHECK_MODULES([LIBCURL], [libcurl],
+    [],
+    [with_libcurl=no])
+])
+
 # Find ncursesw
 AC_ARG_WITH([ncursesw],
   [AS_HELP_STRING([--without-ncursesw], [Build without the ncursesw interface])],
@@ -153,6 +162,12 @@ AC_CHECK_LIB([cap], [cap_set_proc], [], [
 AC_ARG_WITH([ipinfo],
   [AS_HELP_STRING([--without-ipinfo], [Do not try to use ipinfo lookup at all])],
   [], [with_ipinfo=yes])
+AS_IF([test "x$with_ipinfo" = "xyes" && test "x$with_libcurl" != "xyes"], [
+  with_ipinfo=no
+])
+AS_IF([test "x$with_ipinfo" = "xyes" && test "x$with_jansson" != "xyes"], [
+  with_ipinfo=no
+])
 AM_CONDITIONAL([WITH_IPINFO], [test "x$with_ipinfo" = "xyes"])
 AS_IF([test "x$with_ipinfo" = "xyes"], [
   AC_DEFINE([HAVE_IPINFO], [1], [Define when ipinfo lookups are in use])
@@ -297,6 +312,7 @@ echo "ncursesw :$with_ncursesw"
 echo "ncurses  :$with_ncurses"
 echo "gtk      :$with_gtk"
 echo "jansson  :$with_jansson"
+echo "libcurl  :$with_libcurl"
 echo "cap      :$have_cap"
 echo "libs     :$LIBS"
 echo "cflags   :$CFLAGS"

@@ -22,32 +22,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
-#include <sys/types.h>
+#include <ctype.h>
 #ifdef HAVE_ERROR_H
 #include <error.h>
 #else
 #include "portability/error.h"
 #endif
 #include <errno.h>
-
-#ifdef __APPLE__
-#define BIND_8_COMPAT
-#include <dns_sd.h>
-#include <sys/select.h>
-#endif
-#include <arpa/nameser.h>
-#ifdef HAVE_ARPA_NAMESER_COMPAT_H
-#include <arpa/nameser_compat.h>
-#endif
-#include <netdb.h>
-#include <netinet/in.h>
-#include <resolv.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <search.h>
+
+#include <curl/curl.h>
+#include <jansson.h>
 
 #include "mtr.h"
 #include "asn.h"
+#include "dns.h"
 #include "utils.h"
 
 /* #define IIDEBUG */
@@ -58,346 +48,293 @@
 #define DEB_syslog(...) do {} while (0)
 #endif
 
-#define IIHASH_HI	128
-#define ITEMSMAX	15
-#define ITEMSEP	'|'
-#define NAMELEN	127
-#define UNKN	"???"
+#define IIHASH_HI 128
+#define ITEMSMAX 4
+#define ITEM_ASN 0
+#define ITEM_ORG 1
+#define ITEM_COUNTRY 2
+#define ITEM_REGION 3
+#define ITEM_CITY 4
+#define NAMELEN INET6_ADDRSTRLEN
+#define IPINFO_URL_FMT "https://ipinfo.io/%s"
+#define IPINFO_USER_AGENT "curl/8.19.0"
+#define UNKN "???"
 
-static int iihash = 0;
-static char fmtinfo[32];
-
-/* items width: ASN, Route, Country, Registry, Allocated */
-static const int iiwidth[] = { 12, 19, 4, 8, 11 };       /* item len + space */
+static const int iiwidth[] = {
+    12, 34, 4, 18, 18
+};
 
 typedef char *items_t[ITEMSMAX + 1];
-static items_t items_a;         /* without hash: items */
-static char txtrec[NAMELEN + 1];        /* without hash: txtrec */
-static items_t *items = &items_a;
 
-#ifdef __APPLE__
-typedef struct query_context {
-    char txt[NAMELEN + 1];
-    bool more;
-} query_context_t;
+struct ipinfo_response {
+    char *data;
+    size_t size;
+};
 
-static void query_callback(
-    DNSServiceRef sdRef,
-    DNSServiceFlags flags,
-    uint32_t interfaceIndex,
-    DNSServiceErrorType errorCode,
-    const char *fullname,
-    uint16_t rrtype,
-    uint16_t rrclass,
-    uint16_t rdlen,
-    const void *rdata,
-    uint32_t ttl,
-    void *context
-) {
-    struct query_context *q_context = (struct query_context *)context;
+struct ipinfo_cache_entry {
+    char *key;
+    items_t *items;
+    struct ipinfo_cache_entry *next;
+};
 
-    if (errorCode == kDNSServiceErr_NoError && rdlen > 1) {
-        memset(q_context->txt, 0, sizeof(q_context->txt));
-        int remain = sizeof(q_context->txt) - 1;
-        char *p = q_context->txt;
-        const unsigned char *ptr = rdata;
-        const unsigned char *end = ptr + rdlen;
+static int iihash = 0;
+static bool ipinfo_initialized = false;
+static bool curl_initialized = false;
+static struct ipinfo_cache_entry *cache_entries;
+static char fmtinfo[256];
 
-        while (ptr < end) {
-            int len = *ptr++;
-            if (ptr + len > end) {
-                break;
-            }
-            memcpy(p, ptr, (len < remain) ? len : remain);
-            p += len;
-            ptr += len;
-            remain -= len;
-            if (remain <= 0) break;
-        }
-    }
-    q_context->more = (flags & kDNSServiceFlagsMoreComing) && (errorCode == kDNSServiceErr_NoError);
-}
-#endif
-
-static char *ipinfo_lookup(
-    const char *domain)
+static size_t curl_write_cb(
+    void *contents,
+    size_t size,
+    size_t nmemb,
+    void *userp)
 {
-#ifdef __APPLE__
-    DNSServiceRef serviceRef;
-    struct query_context context = {};
-    DNSServiceErrorType error;
+    struct ipinfo_response *response = userp;
+    size_t realsize = size * nmemb;
+    char *new_data = realloc(response->data, response->size + realsize + 1);
 
-    error = DNSServiceQueryRecord(&serviceRef, 0, 0, domain,
-                                  kDNSServiceType_TXT, kDNSServiceClass_IN,
-                                  query_callback, &context);
+    if (!new_data)
+        return 0;
 
-    if (error != kDNSServiceErr_NoError) {
-        fprintf(stderr, "mtr: DNSServiceQueryRecord failed: %d\n", error);
-        return xstrdup(UNKN);
-    }
+    response->data = new_data;
+    memcpy(response->data + response->size, contents, realsize);
+    response->size += realsize;
+    response->data[response->size] = '\0';
 
-    int dns_sd_fd = DNSServiceRefSockFD(serviceRef);
-    if (dns_sd_fd < 0) {
-        fprintf(stderr, "mtr: DNSServiceRefSockFD failed\n");
-        DNSServiceRefDeallocate(serviceRef);
-        return xstrdup(UNKN);
-    }
-
-    do {
-        fd_set rdfds;
-        struct timeval tv;
-        int result;
-
-        FD_ZERO(&rdfds);
-        FD_SET(dns_sd_fd, &rdfds);
-
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-
-        result = select(dns_sd_fd + 1, &rdfds, NULL, NULL, &tv);
-
-        if (result > 0) {
-            if (FD_ISSET(dns_sd_fd, &rdfds)) {
-                DNSServiceProcessResult(serviceRef);
-            }
-        } else {
-            break;
-        }
-    } while (context.more);
-
-    DNSServiceRefDeallocate(serviceRef);
-
-    if (context.txt[0]) {
-        if (iihash) {
-            DEB_syslog(LOG_INFO, "Malloc-txt(%p): %s", context.txt, context.txt);
-            return strdup(context.txt);
-        } else {
-            xstrncpy(txtrec, context.txt, sizeof(txtrec));
-            return txtrec;
-        }
-    }
-
-    return xstrdup(UNKN);
-#else
-    unsigned char answer[PACKETSZ], *pt;
-    char host[128];
-    char *txt;
-    int len, exp, size, txtlen, type;
-
-
-    if (res_init() < 0) {
-        error(0, 0, "@res_init failed");
-        return NULL;
-    }
-
-    memset(answer, 0, PACKETSZ);
-    if ((len = res_query(domain, C_IN, T_TXT, answer, PACKETSZ)) < 0) {
-        if (iihash)
-            DEB_syslog(LOG_INFO, "Malloc-txt: %s", UNKN);
-        return xstrdup(UNKN);
-    }
-
-    pt = answer + sizeof(HEADER);
-
-    if ((exp =
-         dn_expand(answer, answer + len, pt, host, sizeof(host))) < 0) {
-        printf("@dn_expand failed\n");
-        return NULL;
-    }
-
-    pt += exp;
-
-    GETSHORT(type, pt);
-    if (type != T_TXT) {
-        printf("@Broken DNS reply.\n");
-        return NULL;
-    }
-
-    pt += INT16SZ;              /* class */
-
-    if ((exp =
-         dn_expand(answer, answer + len, pt, host, sizeof(host))) < 0) {
-        printf("@second dn_expand failed\n");
-        return NULL;
-    }
-
-    pt += exp;
-    GETSHORT(type, pt);
-    if (type != T_TXT) {
-        printf("@Not a TXT record\n");
-        return NULL;
-    }
-
-    pt += INT16SZ;              /* class */
-    pt += INT32SZ;              /* ttl */
-    GETSHORT(size, pt);
-    txtlen = *pt;
-
-
-    if (txtlen >= size || !txtlen) {
-        printf("@Broken TXT record (txtlen = %d, size = %d)\n", txtlen,
-               size);
-        return NULL;
-    }
-
-    if (txtlen > NAMELEN)
-        txtlen = NAMELEN;
-
-    if (iihash) {
-        txt = xmalloc(txtlen + 1);
-    } else
-        txt = (char *) txtrec;
-
-    pt++;
-    xstrncpy(txt, (char *) pt, txtlen + 1);
-
-    if (iihash)
-        DEB_syslog(LOG_INFO, "Malloc-txt(%p): %s", txt, txt);
-
-    return txt;
-#endif
+    return realsize;
 }
 
-/* originX.asn.cymru.com txtrec:    ASN | Route | Country | Registry | Allocated */
-static char *split_txtrec(
-    struct mtr_ctl *ctl,
-    char *txt_rec)
+static char *dup_json_string(
+    json_t *obj,
+    const char *key)
 {
-    char *prev;
-    char *next;
-    int i = 0, j;
+    json_t *value = json_object_get(obj, key);
 
-    if (!txt_rec)
-        return NULL;
-    if (iihash) {
-        DEB_syslog(LOG_INFO, "Malloc-tbl: %s", txt_rec);
-        if (!(items = malloc(sizeof(*items)))) {
-            DEB_syslog(LOG_INFO, "Free-txt(%p)", txt_rec);
-            free(txt_rec);
-            return NULL;
-        }
-    }
+    if (!json_is_string(value))
+        return xstrdup(UNKN);
 
-    prev = txt_rec;
-
-    while ((next = strchr(prev, ITEMSEP)) && (i < ITEMSMAX)) {
-        *next = '\0';
-        next++;
-        (*items)[i] = trim(prev, ITEMSEP);
-        prev = next;
-        i++;
-    }
-    (*items)[i] = trim(prev, ITEMSEP);
-
-    if (i < ITEMSMAX)
-        i++;
-    for (j = i; j <= ITEMSMAX; j++)
-        (*items)[j] = NULL;
-
-    if (i > ctl->ipinfo_max)
-        ctl->ipinfo_max = i;
-    if (ctl->ipinfo_no >= i) {
-        return (*items)[0];
-    } else
-        return (*items)[ctl->ipinfo_no];
+    return xstrdup(json_string_value(value));
 }
 
-#ifdef ENABLE_IPV6
-/* from dns.c:addr2ip6arpa() */
-static void reverse_host6(
-    struct in6_addr *addr,
-    char *buff,
-    int buff_length)
+static char *extract_asn(
+    const char *org)
+{
+    const char *ptr;
+    char *asn;
+    size_t len;
+
+    if (!org || strncmp(org, "AS", 2) != 0)
+        return xstrdup(UNKN);
+
+    ptr = org + 2;
+    while (*ptr && isdigit((unsigned char) *ptr))
+        ptr++;
+
+    if (ptr == org + 2)
+        return xstrdup(UNKN);
+
+    len = ptr - (org + 2);
+    asn = xmalloc(len + 1);
+    memcpy(asn, org + 2, len);
+    asn[len] = '\0';
+
+    return asn;
+}
+
+static void free_items(
+    items_t *items)
 {
     int i;
-    char *b = buff;
-    // We need to process the top 64 bits, or 8 bytes.
-    for (i = 8-1; i >= 0; i--, b += 4, buff_length -= 4)
-        snprintf(b, buff_length,
-                 "%x.%x.", addr->s6_addr[i] & 0xf, addr->s6_addr[i] >> 4);
-    *--b = 0;
-}
-#endif
 
-#ifdef ENABLE_IPV6
-static bool is_well_known_nat64(struct in6_addr *addr){
-    // 64:ff9b::
-    return addr->s6_addr[0] == 0x00 &&  addr->s6_addr[1] == 0x64 && addr->s6_addr[2] == 0xff && addr->s6_addr[3] == 0x9b;
-}
-#endif
+    if (!items)
+        return;
 
-static char *get_ipinfo(
+    for (i = 0; i <= ITEMSMAX; i++)
+        free((*items)[i]);
+
+    free(items);
+}
+
+static int parse_ipinfo_response(
+    items_t *items,
+    const char *payload)
+{
+    json_error_t json_error;
+    json_t *root;
+
+    root = json_loads(payload, 0, &json_error);
+    if (!root)
+        return -1;
+
+    if (!json_is_object(root)) {
+        json_decref(root);
+        return -1;
+    }
+
+    (*items)[ITEM_ORG] = dup_json_string(root, "org");
+    (*items)[ITEM_COUNTRY] = dup_json_string(root, "country");
+    (*items)[ITEM_REGION] = dup_json_string(root, "region");
+    (*items)[ITEM_CITY] = dup_json_string(root, "city");
+    (*items)[ITEM_ASN] = extract_asn((*items)[ITEM_ORG]);
+
+    json_decref(root);
+    return 0;
+}
+
+static char *lookup_item(
+    items_t *items,
+    int ipinfo_no)
+{
+    if (ipinfo_no < 0 || ipinfo_no > ITEMSMAX)
+        return (*items)[ITEM_ASN];
+
+    if ((*items)[ipinfo_no])
+        return (*items)[ipinfo_no];
+
+    return UNKN;
+}
+
+static items_t *create_unknown_items(
+    void)
+{
+    items_t *items;
+    int i;
+
+    items = xmalloc(sizeof(*items));
+    for (i = 0; i <= ITEMSMAX; i++)
+        (*items)[i] = xstrdup(UNKN);
+
+    return items;
+}
+
+static items_t *ipinfo_lookup(
+    const char *ipstr)
+{
+    CURL *curl;
+    CURLcode res;
+    long http_status = 0;
+    char url[sizeof(IPINFO_URL_FMT) + NAMELEN];
+    items_t *items;
+    struct ipinfo_response response;
+
+    items = create_unknown_items();
+
+    if (snprintf(url, sizeof(url), IPINFO_URL_FMT, ipstr) >= (int) sizeof(url))
+        return items;
+
+    response.data = NULL;
+    response.size = 0;
+
+    curl = curl_easy_init();
+    if (!curl)
+        return items;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, IPINFO_USER_AGENT);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 1000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 2000L);
+
+    res = curl_easy_perform(curl);
+    if (res == CURLE_OK)
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
+
+    if (res == CURLE_OK && http_status == 200 && response.data) {
+        items_t *parsed_items = xmalloc(sizeof(*parsed_items));
+
+        memset(parsed_items, 0, sizeof(*parsed_items));
+        if (parse_ipinfo_response(parsed_items, response.data) == 0) {
+            free_items(items);
+            items = parsed_items;
+        } else {
+            free(parsed_items);
+        }
+    } else {
+        DEB_syslog(LOG_INFO, "ipinfo lookup failed for %s", ipstr);
+    }
+
+    free(response.data);
+    curl_easy_cleanup(curl);
+
+    return items;
+}
+
+static int ensure_ipinfo_init(
+    struct mtr_ctl *ctl)
+{
+    if (!ipinfo_initialized) {
+        ctl->ipinfo_max = ITEMSMAX;
+
+        if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
+            error(0, 0, "ipinfo curl init failed");
+            return -1;
+        }
+        curl_initialized = true;
+
+        DEB_syslog(LOG_INFO, "hcreate(%d)", IIHASH_HI);
+        if (!(iihash = hcreate(IIHASH_HI)))
+            error(0, errno, "ipinfo hash");
+
+        ipinfo_initialized = true;
+    }
+
+    return 0;
+}
+
+static void add_cache_entry(
+    char *key,
+    items_t *items)
+{
+    struct ipinfo_cache_entry *entry;
+
+    entry = xmalloc(sizeof(*entry));
+    entry->key = key;
+    entry->items = items;
+    entry->next = cache_entries;
+    cache_entries = entry;
+}
+
+static items_t *get_items_for_addr(
     struct mtr_ctl *ctl,
-    ip_t * addr)
+    ip_t *addr)
 {
     char key[NAMELEN];
-    char lookup_key[NAMELEN];
-    char *val = NULL;
     ENTRY item;
+    ENTRY *found_item;
+    items_t *items;
 
     if (!addr)
         return NULL;
 
-    if (ctl->af == AF_INET6) {
-#ifdef ENABLE_IPV6
-        if (is_well_known_nat64(addr)) {
-            // Treats the final 4 bytes as IPv4 address
-            unsigned char buff[4];
-            memcpy(buff, addr->s6_addr + 12, 4);
-            if (snprintf
-                (key, NAMELEN, "%d.%d.%d.%d", buff[3], buff[2], buff[1],
-                 buff[0]) >= NAMELEN)
-                return NULL;
-            if (snprintf(lookup_key, NAMELEN, "%s.%s", key, ctl->ipinfo_provider4)
-                >= NAMELEN)
-                return NULL;
-        } else {
-            reverse_host6(addr, key, NAMELEN);
-            if (snprintf(lookup_key, NAMELEN, "%s.%s", key, ctl->ipinfo_provider6)
-                >= NAMELEN)
-                return NULL;
-        }
-#else
+    if (ensure_ipinfo_init(ctl) < 0)
         return NULL;
-#endif
-    } else {
-        unsigned char buff[4];
-        memcpy(buff, addr, 4);
-        if (snprintf
-            (key, NAMELEN, "%d.%d.%d.%d", buff[3], buff[2], buff[1],
-             buff[0]) >= NAMELEN)
-            return NULL;
-        if (snprintf(lookup_key, NAMELEN, "%s.%s", key, ctl->ipinfo_provider4)
-            >= NAMELEN)
-            return NULL;
-    }
+
+    xstrncpy(key, strlongip(ctl->af, addr), sizeof(key));
 
     if (iihash) {
-        ENTRY *found_item;
+        item.key = key;
+        found_item = hsearch(item, FIND);
+        if (found_item)
+            return found_item->data;
+    }
 
-        DEB_syslog(LOG_INFO, ">> Search: %s", key);
-        item.key = key;;
-        if ((found_item = hsearch(item, FIND))) {
-            if (!(val = (*((items_t *) found_item->data))[ctl->ipinfo_no]))
-                val = (*((items_t *) found_item->data))[0];
-            DEB_syslog(LOG_INFO, "Found (hashed): %s", val);
+    items = ipinfo_lookup(key);
+    if (iihash) {
+        item.key = xstrdup(key);
+        item.data = items;
+        if (hsearch(item, ENTER))
+            add_cache_entry(item.key, items);
+        else {
+            free(item.key);
+            free_items(items);
+            items = create_unknown_items();
         }
     }
 
-    if (!val) {
-        DEB_syslog(LOG_INFO, "Lookup: %s", key);
-        if ((val = split_txtrec(ctl, ipinfo_lookup(lookup_key)))) {
-            DEB_syslog(LOG_INFO, "Looked up: %s", key);
-            if (iihash)
-                if ((item.key = xstrdup(key))) {
-                    item.data = (void *) items;
-                    hsearch(item, ENTER);
-                    DEB_syslog(LOG_INFO, "Insert into hash: %s", key);
-                }
-        }
-    }
-
-    return val;
+    return items;
 }
 
 ATTRIBUTE_CONST size_t get_iiwidth_len(
@@ -418,13 +355,19 @@ ATTRIBUTE_CONST int get_iiwidth(
 
 char *fmt_ipinfo(
     struct mtr_ctl *ctl,
-    ip_t * addr)
+    ip_t *addr)
 {
-    char *ipinfo = get_ipinfo(ctl, addr);
+    items_t *items;
     char fmt[8];
+    char *ipinfo;
+
+    items = get_items_for_addr(ctl, addr);
+    ipinfo = items ? lookup_item(items, ctl->ipinfo_no) : UNKN;
+
     snprintf(fmt, sizeof(fmt), "%s%%-%ds", ctl->ipinfo_no ? "" : "AS",
              get_iiwidth(ctl->ipinfo_no));
     snprintf(fmtinfo, sizeof(fmtinfo), fmt, ipinfo ? ipinfo : UNKN);
+
     return fmtinfo;
 }
 
@@ -437,17 +380,34 @@ int is_printii(
 void asn_open(
     struct mtr_ctl *ctl)
 {
-    DEB_syslog(LOG_INFO, "hcreate(%d)", IIHASH_HI);
-    if (!(iihash = hcreate(IIHASH_HI)))
-        error(0, errno, "ipinfo hash");
+    (void) ensure_ipinfo_init(ctl);
 }
 
 void asn_close(
     struct mtr_ctl *ctl)
 {
+    struct ipinfo_cache_entry *entry;
+
+    (void) ctl;
+
     if (iihash) {
         DEB_syslog(LOG_INFO, "hdestroy()");
         hdestroy();
         iihash = 0;
     }
+
+    while (cache_entries) {
+        entry = cache_entries;
+        cache_entries = entry->next;
+        free(entry->key);
+        free_items(entry->items);
+        free(entry);
+    }
+
+    if (curl_initialized) {
+        curl_global_cleanup();
+        curl_initialized = false;
+    }
+
+    ipinfo_initialized = false;
 }

@@ -142,14 +142,10 @@ static void __attribute__ ((__noreturn__)) usage(FILE * out)
     fputs(" -n, --no-dns                     do not resolve host names\n", out);
     fputs(" -b, --show-ips                   show IP numbers and host names\n", out);       
     fputs(" -o, --order FIELDS               select output fields\n", out);
-#ifdef HAVE_IPINFO       
+#ifdef HAVE_IPINFO
     fputs(" -y, --ipinfo NUMBER              select IP information in output\n",
           out);       
     fputs(" -z, --aslookup                   display AS number\n", out);
-    fputs("     --ipinfo_provider4           provider for IPv4 AS lookups\n", out);
-#ifdef ENABLE_IPV6
-    fputs("     --ipinfo_provider6           provider for IPv6 AS lookups\n", out);
-#endif
 #endif       
     fputs(" -h, --help                       display this help and exit\n", out);
     fputs(" -v, --version                    output version information and exit\n", out);  
@@ -301,10 +297,6 @@ static void parse_arg(
      */
     enum {
         OPT_DISPLAYMODE = CHAR_MAX + 1,
-        OPT_IPINFO4 = CHAR_MAX + 2,
-#ifdef ENABLE_IPV6
-        OPT_IPINFO6 = CHAR_MAX + 3,
-#endif /* ifdef ENABLE_IPV6 */
     };
     static const struct option long_options[] = {
         /* option name, has argument, NULL, short name */
@@ -341,10 +333,6 @@ static void parse_arg(
 #ifdef HAVE_IPINFO
         {"ipinfo", 1, NULL, 'y'},       /* IP info lookup */
         {"aslookup", 0, NULL, 'z'},     /* Do AS lookup (--ipinfo 0) */
-        {"ipinfo_provider4", 1, NULL, OPT_IPINFO4},
-#ifdef ENABLE_IPV6
-        {"ipinfo_provider6", 1, NULL, OPT_IPINFO6},
-#endif
 #endif
 
         {"interval", 1, NULL, 'i'},
@@ -628,14 +616,6 @@ static void parse_arg(
         case 'z':
             ctl->ipinfo_no = 0;
             break;
-        case OPT_IPINFO4:
-            ctl->ipinfo_provider4 = optarg;
-            break;
-#ifdef ENABLE_IPV6
-        case OPT_IPINFO6:
-            ctl->ipinfo_provider6 = optarg;
-            break;
-#endif
 #endif
 #ifdef SO_MARK
         case 'M':
@@ -778,12 +758,6 @@ int main(
     ctl.probe_timeout = 10 * 1000000;
     ctl.ipinfo_no = -1;
     ctl.ipinfo_max = -1;
-#ifdef HAVE_IPINFO
-    ctl.ipinfo_provider4 = "origin.asn.cymru.com";
-#ifdef ENABLE_IPV6
-    ctl.ipinfo_provider6 = "origin6.asn.cymru.com";
-#endif
-#endif
 
     xstrncpy(ctl.fld_active, "LS NABWV", 2 * MAXFLD);
 
